@@ -4,6 +4,8 @@ Open-source ([Apache-2.0](./LICENSE)) capability adapters for the **[Capability 
 
 This repository holds the **publicly released** adapters. It is a curated subset of the broader CHP adapter ecosystem — the generic, reusable governance/safety capabilities. It is published from the project's governed development flow; issues and discussion for all published packages live on [`chp-core`](https://github.com/capabilityhostprotocol/chp-core/issues).
 
+> **New here?** [**QUICKSTART.md**](./QUICKSTART.md) takes you from `pip install` to a verified, tamper-evident evidence chain in ~5 minutes — govern an agent's actions and prove the controls held. Runnable source: [`examples/quickstart.py`](./examples/quickstart.py).
+
 ## Packages
 
 | Package | PyPI | What it adds |
