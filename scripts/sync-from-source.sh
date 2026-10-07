@@ -42,15 +42,18 @@ for a in "${PUBLIC_ADAPTERS[@]}"; do
   s="$SRC/$a"; pkg="${a//-/_}"; d="$ROOT/packages/$a"
   [ -d "$s" ] || { echo "SKIP $a (not in source)"; continue; }
   echo "== sync $a =="
-  rm -rf "$d"; mkdir -p "$d/$pkg" "$d/tests"
+  rm -rf "$d"; mkdir -p "$d"
   cp "$s/pyproject.toml" "$d/"
   for f in LICENSE NOTICE README.md; do [ -f "$s/$f" ] && cp "$s/$f" "$d/"; done
-  find "$s/$pkg" -maxdepth 1 -name '*.py' -exec cp {} "$d/$pkg/" \;
-  if [ -d "$s/$pkg/trust_anchors" ]; then
-    mkdir -p "$d/$pkg/trust_anchors"
-    cp "$s/$pkg/trust_anchors/"*.der "$s/$pkg/trust_anchors/"*.md "$d/$pkg/trust_anchors/" 2>/dev/null || true
-  fi
-  [ -d "$s/tests" ] && find "$s/tests" -maxdepth 1 -name '*.py' -exec cp {} "$d/tests/" \;
+  # copy the FULL package tree (incl. nested subpackages like _ops/) — source + data only, no
+  # artifacts (-m prunes empty dirs; junk excluded before the source includes + final catch-all).
+  rsync -a -m \
+    --exclude='__pycache__/' --exclude='*.pyc' --exclude='*.whl' \
+    --exclude='*.sqlite' --exclude='*.sqlite3' --exclude='.chp/' \
+    --include='*/' --include='*.py' --include='*.der' --include='*.md' --exclude='*' \
+    "$s/$pkg/" "$d/$pkg/"
+  [ -d "$s/tests" ] && rsync -a -m \
+    --include='*/' --include='*.py' --exclude='*' "$s/tests/" "$d/tests/"
 done
 
 echo "== hygiene audit (FAIL if any forbidden artifact) =="
