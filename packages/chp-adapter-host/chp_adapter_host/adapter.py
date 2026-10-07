@@ -1,0 +1,718 @@
+"""HostAdapter — report and update the CHP runtime on this node.
+
+Two capabilities:
+
+* ``version`` — report this node's chp-host version, platform, installed adapters.
+* ``update``  — schedule a **detached** ``chp-host update --restart``. The host
+  running this capability will be restarted by the upgrade, so the work must
+  outlive it: we spawn the updater in a new session and return immediately
+  (``scheduled: true``) *before* anything restarts. The caller re-checks
+  ``/health`` to see the new version.
+
+Depends only on chp-core. It does NOT import chp-host (it shells out to the
+installed ``chp-host`` CLI) and discovers adapters via entry points, so there is
+no dependency cycle.
+"""
+
+from __future__ import annotations
+
+import getpass
+import glob
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+from chp_core import BaseAdapter, capability
+from chp_core.stats import collect_host_stats
+
+
+def _host_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version("chp-host")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _installed_adapters() -> list[str]:
+    from importlib.metadata import entry_points
+    return sorted(ep.name for ep in entry_points(group="chp.adapters"))
+
+
+def _service_safe_env() -> dict[str, str]:
+    """A child environment safe for use under launchd/systemd (minimal env).
+
+    Ensures HOME (the service env often lacks it, which breaks pip's cache and
+    the ~/.chp log path) and a full PATH including /usr/sbin (where ioreg/sysctl
+    and other tools live). Cross-platform: os.path.expanduser resolves ~ via HOME
+    on POSIX and USERPROFILE on Windows — no `pwd` (Unix-only, absent on Windows,
+    which broke adapter provisioning to Windows nodes)."""
+    env = dict(os.environ)
+    if not env.get("HOME"):
+        home = os.path.expanduser("~")
+        env["HOME"] = home if home and home != "~" else (env.get("USERPROFILE") or os.getcwd())
+    if os.name != "nt":   # the extra Unix tool dirs (and ':' separator) are meaningless on Windows
+        extra = "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin:/opt/homebrew/bin"
+        env["PATH"] = (env.get("PATH", "") + ":" + extra).strip(":")
+    return env
+
+
+def _profile_path_from_argv() -> str | None:
+    """The --profile path this host was started with (so install_adapter can add a
+    new adapter to the very profile this serve process is running). The host adapter
+    runs inside `chp-host serve --profile <path>`, so sys.argv carries it."""
+    argv = sys.argv
+    for i, a in enumerate(argv):
+        if a == "--profile" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--profile="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _spawn_detached_cli(args: list[str], log_name: str) -> int:
+    """Spawn `python -m chp_host.cli <args>` detached, with a service-safe env,
+    capturing the child's stdout+stderr to ~/.chp/logs/<log_name> (so a failed
+    remote action is diagnosable, e.g. via filesystem.read_file over the mesh).
+    Returns the child pid. Used by update + restart, which must outlive the
+    service restart they trigger.
+    """
+    child_env = _service_safe_env()
+    log_dir = os.path.join(child_env["HOME"], ".chp", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    fd = os.open(os.path.join(log_dir, log_name), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "chp_host.cli", *args],
+            stdout=fd, stderr=fd, start_new_session=True, env=child_env,
+        )
+    finally:
+        os.close(fd)  # Popen duplicated the fd; close our copy
+    return proc.pid
+
+
+# ---------------------------------------------------------------------------
+# Node setup introspection (host.facts) — turns ad-hoc spelunking into one call.
+# ---------------------------------------------------------------------------
+
+def _facts_env() -> dict:
+    """Env with common tool dirs prepended to PATH (rad/claude/homebrew live off the bare PATH)."""
+    env = dict(os.environ)
+    extra = [os.path.expanduser(p) for p in
+             ("~/.radicle/bin", "~/.local/bin", "~/.npm-global/bin", "~/.cargo/bin")] + ["/opt/homebrew/bin"]
+    env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+    return env
+
+
+def _facts_sh(args: list[str], timeout: int = 10) -> str:
+    """Run a command on the augmented PATH; return stripped stdout ('' on any failure)."""
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=_facts_env())
+        return (out.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _facts_tool(name: str) -> dict:
+    """Locate a binary on the augmented PATH + its version (best-effort)."""
+    path = shutil.which(name, path=_facts_env()["PATH"])
+    if not path:
+        return {"present": False}
+    info = {"present": True, "path": path}
+    ver = _facts_sh([path, "--version"], timeout=8)
+    if ver:
+        info["version"] = ver.splitlines()[0][:60]
+    return info
+
+
+# ── inference capacity (can this node serve a given LLM?) ─────────────────────
+# Bytes-per-weight by quantization (MLX/GGUF community approx): weights_gb ≈ params_b × bytes/weight.
+_BYTES_PER_WEIGHT = {"q2": 0.33, "q3": 0.43, "q4": 0.55, "q5": 0.68, "q6": 0.81,
+                     "q8": 1.06, "fp16": 2.0, "bf16": 2.0, "fp32": 4.0}
+
+
+def _free_mem_gb() -> float | None:
+    """Currently-free physical memory in GB (best-effort, macOS vm_stat)."""
+    vm = _facts_sh(["vm_stat"])
+    if not vm:
+        return None
+    page = 4096
+    m = re.search(r"page size of (\d+)", vm)
+    if m:
+        page = int(m.group(1))
+    free = 0
+    for key in ("Pages free", "Pages inactive", "Pages speculative"):
+        mm = re.search(rf"{key}:\s+(\d+)", vm)
+        if mm:
+            free += int(mm.group(1))
+    return round(free * page / 1e9, 1) if free else None
+
+
+def _total_ram_gb() -> float:
+    """Total system RAM (GB), cross-platform. Darwin: sysctl; Linux: /proc/meminfo; Windows:
+    ctypes GlobalMemoryStatusEx (os.sysconf is absent on Windows — the bug that returned 0)."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            b = int(_facts_sh(["sysctl", "-n", "hw.memsize"]) or 0)
+            return round(b / 1e9, 1) if b else 0.0
+        if system == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal"):
+                        return round(int(line.split()[1]) * 1024 / 1e9, 1)  # kB → GB
+        if system == "Windows":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS()
+            ms.dwLength = ctypes.sizeof(_MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))  # type: ignore[attr-defined]
+            return round(ms.ullTotalPhys / 1e9, 1)
+    except Exception:
+        return 0.0
+    # Last resort (POSIX with sysconf): pages × page size
+    try:
+        return round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)
+    except Exception:
+        return 0.0
+
+
+def _nvidia_vram() -> tuple[str, float] | None:
+    """(model, total VRAM GB) of GPU 0 via nvidia-smi — cross-platform (incl. the Windows path
+    the old code missed), or None if no NVIDIA GPU."""
+    smi = shutil.which("nvidia-smi") or r"C:\Windows\System32\nvidia-smi.exe"
+    try:
+        out = subprocess.run(
+            [smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8)
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        name, mem = out.stdout.strip().splitlines()[0].split(",")
+        return name.strip(), round(int(mem.strip()) / 1024, 1)  # MiB → GB
+    except Exception:
+        return None
+
+
+def _inference_capacity() -> dict[str, Any]:
+    """What this node can serve: the memory ceiling an LLM (weights + KV cache) must fit under, plus
+    free memory. NVIDIA (discrete VRAM), Apple-Silicon (unified memory), and CPU-only aware —
+    cross-platform, so a Windows NVIDIA node reports real VRAM instead of 0."""
+    is_darwin = platform.system() == "Darwin"
+    arch = platform.machine()
+    ram_gb = _total_ram_gb()
+    nvidia = _nvidia_vram()
+    gpu_model: str | None = None
+    if nvidia:
+        gpu_model, gpu_gb = nvidia          # discrete GPU: real VRAM is the ceiling
+        unified = False
+        source = "nvidia-smi"
+    elif is_darwin and arch == "arm64":
+        unified = True
+        # Metal GPU ceiling: iogpu.wired_limit_mb if raised, else the OS default (~75% of unified RAM;
+        # ~25% reserved for macOS + framework + KV/runtime overhead).
+        wired_mb = int(_facts_sh(["sysctl", "-n", "iogpu.wired_limit_mb"]) or 0)
+        gpu_gb = round(wired_mb * 1024 * 1024 / 1e9, 1) if wired_mb > 0 else round(ram_gb * 0.75, 1)
+        gpu_model = "Apple Silicon GPU"
+        source = "iogpu.wired_limit_mb" if wired_mb > 0 else "~75% unified RAM (default)"
+    else:
+        unified = False
+        gpu_gb = round(ram_gb * 0.5, 1)     # CPU-only estimate (no discrete GPU detected)
+        source = "~50% RAM (estimate, no discrete GPU)"
+    return {"platform": platform.platform(), "arch": arch, "cpu_count": os.cpu_count(),
+            "unified_memory": unified, "ram_gb": ram_gb, "gpu_memory_gb": gpu_gb,
+            "gpu_model": gpu_model, "free_gb": _free_mem_gb(), "gpu_ceiling_source": source}
+
+
+def _guess_layers(params_b: float) -> int:
+    """Rough transformer depth from param count when the caller doesn't give it."""
+    for cutoff, layers in ((1, 24), (4, 36), (9, 28), (16, 40), (35, 48)):
+        if params_b <= cutoff:
+            return layers
+    return 64
+
+
+def _estimate_fit(cap: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
+    """Estimate whether a model fits under this node's ceiling (weights + KV cache + overhead).
+    HEURISTIC — be conservative and verify with a real load; KV cache grows with context, which is
+    the usual Metal-OOM cause on a long agentic run."""
+    params_b = float(model.get("params_b", 0) or 0)
+    bpw = _BYTES_PER_WEIGHT.get(str(model.get("quant", "q4")).lower(), 0.55)
+    ctx = int(model.get("context_tokens", 8192) or 8192)
+    layers = int(model.get("layers") or 0) or _guess_layers(params_b)
+    kv_heads = int(model.get("kv_heads") or 0) or 8      # GQA typical
+    head_dim = int(model.get("head_dim") or 0) or 128
+    weights_gb = round(params_b * bpw, 2)
+    kv_gb = round(2 * layers * kv_heads * head_dim * ctx * 2 / 1e9, 2)   # 2(K+V) × … × 2 bytes fp16
+    overhead_gb = 2.0
+    steady_gb = round(weights_gb + kv_gb + overhead_gb, 1)
+    # Prompt-processing PEAK: processing a long prompt allocates large transient buffers ~another
+    # KV-cache worth (empirically the Metal-OOM driver on long agentic runs). Plan against the peak.
+    peak_gb = round(steady_gb + kv_gb, 1)
+    ceiling = float(cap.get("gpu_memory_gb") or 0)
+    free = cap.get("free_gb")
+    return {"weights_gb": weights_gb, "kv_cache_gb": kv_gb, "overhead_gb": overhead_gb,
+            "estimated_steady_gb": steady_gb, "estimated_peak_gb": peak_gb,
+            "ceiling_gb": ceiling, "free_gb_now": free,
+            # cold: on an idle node (peak under the ceiling, with 15% headroom). now: given free memory.
+            "fits_cold": bool(ceiling) and peak_gb <= ceiling * 0.85,
+            "fits_now": (free is None) or (peak_gb <= free),
+            "headroom_gb": round(ceiling - peak_gb, 1) if ceiling else None,
+            "context_tokens": ctx, "quant": str(model.get("quant", "q4")).lower(),
+            "note": "estimate: plan against PEAK (steady + a KV-cache worth for prompt processing); "
+                    "KV grows with context — the usual OOM. fits_cold assumes an idle node; fits_now "
+                    "uses current free memory. Verify a marginal model with a real load."}
+
+
+class HostAdapter(BaseAdapter):
+    adapter_id = "chp.adapters.host"
+    adapter_name = "Host"
+    adapter_description = "Report and update the CHP host runtime on this node."
+    adapter_category = "infrastructure"
+    adapter_tags = ["host", "update", "version", "infrastructure", "ops"]
+
+    def on_register(self, host: Any) -> None:
+        self._host = host  # for the capability catalog (host.discover)
+
+    @capability(
+        id="chp.adapters.host.discover",
+        version="1.0.0",
+        description="List this node's capability catalog (id, risk, category, adapter), with optional "
+                    "namespace/category/risk filters. Read-only — the mesh-invokable view of GET /capabilities.",
+        category="infrastructure",
+        risk="low",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "namespace": {"type": "string",
+                              "description": "Prefix filter on capability id, e.g. 'chp.adapters.git.'"},
+                "category": {"type": "string", "description": "Exact category filter."},
+                "risk": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                "ids_only": {"type": "boolean", "description": "Return just the sorted capability id list."},
+            },
+            "additionalProperties": False,
+        },
+        emits=["host_catalog_reported"],
+        tags=["host", "discover", "catalog"],
+    )
+    async def discover(self, ctx: Any, payload: dict) -> dict:
+        host = getattr(self, "_host", None)
+        if host is None:
+            return {"error": "host catalog unavailable (adapter not registered to a host)"}
+        kwargs = {k: payload[k] for k in ("namespace", "category", "risk") if payload.get(k)}
+        desc = host.discover(**kwargs) or {}
+        caps = desc.get("capabilities", [])
+        adapters = sorted({c["id"].split(".")[2] for c in caps
+                           if c.get("id") and c["id"].count(".") >= 2})
+        ctx.emit("host_catalog_reported", {"count": len(caps), "adapters": len(adapters)})
+        if payload.get("ids_only"):
+            return {"count": len(caps), "adapters": adapters,
+                    "capability_ids": sorted(c.get("id") for c in caps if c.get("id"))}
+        slim = [{"id": c.get("id"), "risk": c.get("risk"), "category": c.get("category"),
+                 "description": (c.get("description") or "")[:120]} for c in caps]
+        return {"count": len(caps), "adapters": adapters, "capabilities": slim}
+
+    @capability(
+        id="chp.adapters.host.version",
+        version="1.0.0",
+        description="Report this node's chp-host version, platform, and installed adapters.",
+        category="infrastructure",
+        risk="low",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        emits=["host_version_reported"],
+        tags=["host", "version"],
+    )
+    async def version(self, ctx: Any, payload: dict) -> dict:
+        info = {
+            "host_version": _host_version(),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "adapters": _installed_adapters(),
+        }
+        ctx.emit("host_version_reported", {"host_version": info["host_version"]})
+        return info
+
+    @capability(
+        id="chp.adapters.host.invoke",
+        version="1.0.0",
+        description="Invoke a capability on ANOTHER CHP host over the normative HTTP binding (federated "
+                    "invocation). The remote host runs the capability and signs its OWN evidence; the caller "
+                    "layers its governance on top. This is the reusable client primitive for product-layer "
+                    "bridges — e.g. an agent gateway reaching a chp-home control's governed agent-run so a "
+                    "contributed node does the work — so no product hand-rolls RemoteCapabilityHost (the "
+                    "same lesson as consuming chp-transport-zenoh). base_url is caller/operator-supplied; "
+                    "treat it as the destination allowlist boundary.",
+        category="infrastructure",
+        risk="medium",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "base_url": {"type": "string",
+                             "description": "The remote CHP host's HTTP binding, e.g. http://100.80.22.83:8802."},
+                "capability_id": {"type": "string", "description": "Capability id to invoke on the remote host."},
+                "payload": {"type": "object", "description": "Payload for the remote capability.",
+                            "additionalProperties": True},
+                "version": {"type": "string", "description": "Optional capability version to request."},
+                "api_key": {"type": "string",
+                            "description": "Bearer token the remote host authenticates the caller with (if required)."},
+                "timeout": {"type": "integer", "minimum": 1, "maximum": 3600,
+                            "description": "Per-call timeout in seconds (default 120)."},
+            },
+            "required": ["base_url", "capability_id"],
+            "additionalProperties": False,
+        },
+        emits=["host_remote_invoked", "host_mesh_key_lookup_skipped"],
+        tags=["host", "invoke", "remote", "federation"],
+    )
+    async def invoke(self, ctx: Any, payload: dict) -> dict:
+        from chp_core.http import RemoteCapabilityHost
+        base_url = str(payload["base_url"])
+        capability_id = str(payload["capability_id"])
+        # federated auth: default the bearer to the node's mesh HTTP key when the caller doesn't supply
+        # one — so cross-node invocation self-authenticates node-side and the shared key never rides in
+        # the caller's payload/evidence. Source order mirrors mesh_auth: CHP_MESH_HTTP_KEY env, then the
+        # node's own secrets store (mesh/http_control_key, composed via the local secrets cap).
+        api_key = payload.get("api_key") or os.environ.get("CHP_MESH_HTTP_KEY")
+        if not api_key:
+            try:
+                r = await ctx.ainvoke("chp.adapters.secrets.get", {"key": "mesh/http_control_key"})
+                if getattr(r, "success", False):
+                    api_key = (r.data or {}).get("value") or (r.data or {}).get("secret")
+            except Exception as exc:  # no secrets cap / not set → auth simply not configured
+                ctx.emit("host_mesh_key_lookup_skipped", {"error": str(exc)[:120]}, redacted=False)
+        remote = RemoteCapabilityHost(base_url, timeout=int(payload.get("timeout") or 120),
+                                      api_key=api_key or None)
+        result = await remote.ainvoke(capability_id, payload.get("payload") or {},
+                                      version=payload.get("version") or None)
+        outcome = getattr(result, "outcome", None)
+        try:
+            remote_host_key_id = (remote.identity() or {}).get("key_id")
+        except Exception:  # noqa: BLE001 — identity is best-effort provenance, not part of the result
+            remote_host_key_id = None
+        ctx.emit("host_remote_invoked",
+                 {"base_url": base_url, "capability_id": capability_id, "outcome": outcome})
+        return {
+            "outcome": outcome,
+            "data": getattr(result, "data", None),
+            "error": getattr(result, "error", None),
+            "invocation_id": getattr(result, "invocation_id", None),
+            "remote_host_key_id": remote_host_key_id,
+        }
+
+    @capability(
+        id="chp.adapters.host.facts",
+        version="1.0.0",
+        description="Introspect THIS node's setup in one call: host/arch/python, toolchain (claude/codex/rad/"
+                    "git paths+versions), launchd services, radicle identity/homes/node/seed-policies, and rad "
+                    "repo checkouts. The 'how is this node configured' view (Ansible-facts-shaped). Runs locally "
+                    "on whichever node it is routed to.",
+        category="infrastructure",
+        risk="low",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "sections": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["host", "tools", "services", "radicle", "repos"]},
+                    "description": "Subset of fact sections to gather (default: all).",
+                },
+            },
+            "additionalProperties": False,
+        },
+        emits=["host_facts_reported"],
+        tags=["host", "facts", "introspection", "setup", "ops"],
+    )
+    async def facts(self, ctx: Any, payload: dict) -> dict:
+        sections = set(payload.get("sections") or ["host", "tools", "services", "radicle", "repos"])
+        out: dict[str, Any] = {}
+
+        if "host" in sections:
+            try:
+                user = getpass.getuser()
+            except Exception:
+                user = os.environ.get("USER", "")
+            out["host"] = {
+                "hostname": platform.node(), "platform": platform.platform(),
+                "arch": platform.machine(), "user": user,
+                "python": sys.executable, "home": os.path.expanduser("~"),
+            }
+
+        if "tools" in sections:
+            out["tools"] = {n: _facts_tool(n) for n in ("claude", "codex", "gemini", "rad", "git", "node")}
+
+        if "services" in sections:
+            ll = _facts_sh(["launchctl", "list"])
+            out["services"] = sorted({
+                line.split()[-1] for line in ll.splitlines()
+                if line.split() and ("chp" in line.lower() or "rad" in line.lower())
+            })[:25]
+
+        if "radicle" in sections:
+            rad: dict[str, Any] = {}
+            for line in _facts_sh(["rad", "self"]).splitlines():
+                low = line.strip().lower()
+                if low.startswith("alias"):
+                    rad["alias"] = line.split(None, 1)[-1].strip()
+                elif low.startswith("did"):
+                    rad["did"] = line.split(None, 1)[-1].strip()  # did:key is a public id (NID not surfaced)
+            rad["homes"] = sorted(os.path.basename(p) for p in glob.glob(os.path.expanduser("~/.radicle*")))
+            node = _facts_sh(["rad", "node", "status"])
+            rad["node_running"] = "running" in node.lower() and "not running" not in node.lower()
+            seed = _facts_sh(["rad", "seed"])
+            rad["seeded_repos"] = sum(1 for line in seed.splitlines()
+                                      if line.strip().startswith("│") and "rad:" in line)
+            out["radicle"] = rad
+
+        if "repos" in sections:
+            repos = []
+            for line in _facts_sh(["rad", "ls"]).splitlines():
+                m = re.search(r"rad:[0-9a-zA-Z]+", line)
+                if m and line.strip().startswith("│"):
+                    name = line.strip("│").split()[0] if line.strip("│").split() else ""
+                    repos.append({"name": name, "rid": m.group(0)})
+            out["repos"] = repos[:40]
+
+        tools_present = sum(1 for t in out.get("tools", {}).values() if t.get("present"))
+        ctx.emit("host_facts_reported",
+                 {"sections": sorted(out.keys()), "tools_present": tools_present})
+        return out
+
+    @capability(
+        id="chp.adapters.host.topology",
+        version="1.0.0",
+        description="Mesh connectivity view from this node: the radicle peer graph (who it's connected to) "
+                    "+ Tailscale device status (which mesh nodes are online). 'Where the nodes are connected'.",
+        category="infrastructure",
+        risk="low",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        emits=["host_topology_reported"],
+        tags=["host", "topology", "mesh", "connectivity", "ops"],
+    )
+    async def topology(self, ctx: Any, payload: dict) -> dict:
+        # Radicle peer graph (connected = "✓" marker; address shown for reachable peers).
+        peers = []
+        for line in _facts_sh(["rad", "node", "status"]).splitlines():
+            if "│" not in line:
+                continue
+            nid = re.search(r"z6Mk[0-9A-Za-z]{20,}", line)
+            addr = re.search(r"\b(100\.\d+\.\d+\.\d+:\d+|[\w.-]+:\d{2,5})\b", line)
+            if nid:
+                peers.append({"nid": nid.group(0)[:14] + "…", "address": addr.group(0) if addr else "",
+                              "connected": "✓" in line})
+
+        # Tailscale device status (mesh-node reachability).
+        ts = _facts_sh(["tailscale", "status"]) or \
+            _facts_sh(["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "status"])
+        devices = []
+        for line in ts.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("100."):
+                devices.append({"ip": parts[0], "name": parts[1],
+                                "os": parts[3] if len(parts) >= 4 else "",
+                                "online": "offline" not in line.lower()})
+
+        result = {"radicle_peers": peers,
+                  "radicle_connected": sum(1 for p in peers if p["connected"]),
+                  "tailscale_devices": devices[:50],
+                  "tailscale_online": sum(1 for d in devices if d["online"])}
+        ctx.emit("host_topology_reported",
+                 {"peers": len(peers), "devices": len(devices), "online": result["tailscale_online"]})
+        return result
+
+    @capability(
+        id="chp.adapters.host.stats",
+        version="1.0.0",
+        description="Report CPU load, memory, disk, GPU, and platform stats for this node.",
+        category="infrastructure",
+        risk="low",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        emits=["host_stats_reported"],
+        tags=["host", "stats", "capacity"],
+    )
+    async def stats(self, ctx: Any, payload: dict) -> dict:
+        result = collect_host_stats()
+        ctx.emit("host_stats_reported", {
+            "load_per_core": result.get("load_per_core"),
+            "gpu": result.get("gpu"),
+        })
+        return result
+
+    @capability(
+        id="chp.adapters.host.inference_capacity",
+        version="1.0.0",
+        description="What LLM inference this node can serve: unified/GPU memory ceiling, free memory, "
+                    "and — given {params_b, quant, context_tokens} — whether the model FITS. Lets the "
+                    "mesh place inference on a device that won't Metal-OOM. Apple-Silicon aware.",
+        category="infrastructure",
+        risk="low",
+        input_schema={"type": "object", "properties": {"model": {"type": "object",
+            "description": "optional {params_b, quant (q4/q8/fp16), context_tokens, layers?, "
+                           "kv_heads?, head_dim?} to get a fit verdict"}},
+            "additionalProperties": False},
+        emits=["inference_capacity_reported"],
+        tags=["host", "inference", "capacity", "gpu", "mlx"],
+    )
+    async def inference_capacity(self, ctx: Any, payload: dict) -> dict:
+        cap = _inference_capacity()
+        model = payload.get("model")
+        if model:
+            cap["fit"] = _estimate_fit(cap, model)
+        ctx.emit("inference_capacity_reported",
+                 {"gpu_memory_gb": cap.get("gpu_memory_gb"), "ram_gb": cap.get("ram_gb"),
+                  "fits": (cap.get("fit") or {}).get("fits")})
+        return cap
+
+    @capability(
+        id="chp.adapters.host.update",
+        version="1.0.0",
+        description="Schedule a detached upgrade of this node's CHP packages, then restart its services.",
+        category="infrastructure",
+        risk="high",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "version": {"type": "string", "description": "Pin chp-core/chp-host to this version."},
+                "channel": {"type": "string", "enum": ["github", "pypi"]},
+                "require_provenance": {"type": "boolean", "default": False, "description": "Verify every package's signed provenance BEFORE upgrading any (spec section 9, atomic)."},
+            },
+            "additionalProperties": False,
+        },
+        emits=["host_update_scheduled"],
+        tags=["host", "update", "ops"],
+    )
+    async def update(self, ctx: Any, payload: dict) -> dict:
+        before = _host_version()
+        # `chp-host update` restarts by default (the flag is --no-restart).
+        args = ["update"]
+        if payload.get("require_provenance"):
+            args += ["--require-provenance"]
+            store_path = getattr(getattr(getattr(ctx, "host", None), "store", None), "path", None)
+            if store_path and store_path != ":memory:":
+                child = ctx.child_correlation()
+                args += ["--evidence-store", str(store_path),
+                         "--correlation-id", str(child.correlation_id),
+                         "--host-id", str(getattr(ctx.host, "host_id", "") or "unknown")]
+                if child.causation_id:
+                    args += ["--causation-id", str(child.causation_id)]
+        if payload.get("version"):
+            args += ["--version", str(payload["version"])]
+        if payload.get("channel"):
+            args += ["--channel", str(payload["channel"])]
+        pid = _spawn_detached_cli(args, "host-update-child.log")
+        ctx.emit("host_update_scheduled", {"from_version": before, "pid": pid})
+        return {
+            "from_version": before,
+            "scheduled": True,
+            "pid": pid,
+            "note": "Update runs detached; this host will restart shortly. "
+                    "Re-check /health for the new host_version.",
+        }
+
+    @capability(
+        id="chp.adapters.host.install_adapter",
+        version="1.0.0",
+        description=(
+            "Install (or pull) a CHP adapter package onto this node, optionally add it "
+            "to this host's profile, then restart so the new capabilities register. "
+            "Detached — this host restarts shortly after scheduling."
+        ),
+        category="infrastructure",
+        risk="high",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "package": {"type": "string", "description": "pip package name, e.g. 'chp-adapter-mlx'"},
+                "version": {"type": "string", "description": "Pin to this version (ignored if url is set)."},
+                "url": {"type": "string", "description": "Direct wheel/sdist URL (e.g. a GitHub release asset)."},
+                "adapter_name": {"type": "string", "description": "Short entry-point name to add to this host's profile, e.g. 'mlx'."},
+                "extras": {"type": "string", "description": "Optional-dependency extra to also install, e.g. 'serve' → chp-adapter-mlx[serve] (pulls the adapter's runtime tooling)."},
+                "restart": {"type": "boolean", "default": True},
+                "require_provenance": {"type": "boolean", "default": False, "description": "Verify the publisher's signed provenance statement against the artifact BEFORE installing (spec section 9)."},
+                "publisher_key": {"type": "string", "description": "Require this publisher key_id."},
+                "publisher_domain": {"type": "string", "description": "Require this domain anchor on the publisher attestation."},
+                "provenance": {"type": "string", "description": "Statement path/URL (default: GitHub release asset convention)."},
+            },
+            "required": ["package"],
+            "additionalProperties": False,
+        },
+        emits=["host_adapter_install_scheduled", "host_adapter_installed"],
+        tags=["host", "adapter", "install", "ops"],
+    )
+    async def install_adapter(self, ctx: Any, payload: dict) -> dict:
+        package = str(payload.get("package") or "").strip()
+        if not package:
+            raise ValueError("package is required")
+        args = ["install-adapter", package]
+        # Deferred-evidence coordinates (chp-v0.2.md §7): the detached install
+        # appends `host_adapter_installed` (version + record_sha256 provenance)
+        # under THIS correlation with a causal edge to this invocation.
+        store_path = getattr(getattr(getattr(ctx, "host", None), "store", None), "path", None)
+        if store_path and store_path != ":memory:":
+            child = ctx.child_correlation()
+            args += ["--evidence-store", str(store_path),
+                     "--correlation-id", str(child.correlation_id),
+                     "--host-id", str(getattr(ctx.host, "host_id", "") or "unknown")]
+            if child.causation_id:
+                args += ["--causation-id", str(child.causation_id)]
+        if payload.get("url"):
+            args += ["--url", str(payload["url"])]
+        elif payload.get("version"):
+            args += ["--version", str(payload["version"])]
+        if payload.get("extras"):
+            args += ["--extras", str(payload["extras"])]
+        adapter_name = payload.get("adapter_name")
+        profile = None
+        if adapter_name:
+            args += ["--adapter-name", str(adapter_name)]
+            profile = _profile_path_from_argv()
+            if profile:
+                args += ["--profile", profile]
+        if payload.get("require_provenance"):
+            args += ["--require-provenance"]
+            for flag in ("publisher_key", "publisher_domain", "provenance"):
+                if payload.get(flag):
+                    args += [f"--{flag.replace('_', '-')}", str(payload[flag])]
+        if payload.get("restart") is False:
+            args += ["--no-restart"]
+        pid = _spawn_detached_cli(args, "host-install-adapter-child.log")
+        ctx.emit("host_adapter_install_scheduled",
+                 {"package": package, "adapter_name": adapter_name, "pid": pid})
+        return {
+            "scheduled": True,
+            "pid": pid,
+            "package": package,
+            "adapter_name": adapter_name,
+            "profile": profile,
+            "note": "Install runs detached; this node restarts shortly. Re-check "
+                    "/capabilities (or host.version adapters) for the new adapter.",
+        }
+
+    @capability(
+        id="chp.adapters.host.restart",
+        version="1.0.0",
+        description="Restart this node's CHP services (detached, no upgrade).",
+        category="infrastructure",
+        risk="high",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        emits=["host_restart_scheduled"],
+        tags=["host", "restart", "ops"],
+    )
+    async def restart(self, ctx: Any, payload: dict) -> dict:
+        # Detached so it survives the very services it restarts. Captures output
+        # to ~/.chp/logs/host-restart-child.log for remote diagnosis.
+        pid = _spawn_detached_cli(["restart"], "host-restart-child.log")
+        ctx.emit("host_restart_scheduled", {"pid": pid})
+        return {
+            "scheduled": True,
+            "pid": pid,
+            "note": "Restart runs detached; this node's services bounce shortly.",
+        }

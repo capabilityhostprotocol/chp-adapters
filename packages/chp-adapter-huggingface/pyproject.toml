@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chp-adapter-huggingface"
+version = "0.59.4"
+description = "CHP adapter for local HuggingFace artifact consumption — pull, pipeline, embed, tokenize, dataset, cache"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+license-files = ["LICENSE", "NOTICE"]
+dependencies = [
+    "chp-core",
+    "huggingface_hub>=0.24",
+    "transformers>=4.40",
+    "datasets>=2.20",
+    "tokenizers>=0.19",
+]
+keywords = ["chp", "capability-host-protocol", "huggingface", "transformers", "nlp"]
+
+[project.optional-dependencies]
+torch = ["torch"]
+lifecycle = ["evaluate>=0.4", "gradio-client>=1.0", "peft>=0.10"]
+multimodal = ["diffusers>=0.30", "librosa>=0.10", "soundfile>=0.12"]
+train = ["trl>=0.15", "peft>=0.10", "bitsandbytes>=0.43", "accelerate>=0.30", "datasets>=2.0"]
+# AWQ/GPTQ quantize (huggingface.quantize) → vLLM-loadable int4 dirs. Self-contained: torch +
+# accelerate are the runtime the quantizers need (autoawq/gptqmodel declare them, listed explicitly
+# so provisioning a GPU node installs everything). GPU/CUDA node only — the CUDA torch build resolves
+# from the node's index; on a non-CUDA host (e.g. macOS) these have no wheel and won't install, so
+# keep quant OUT of the global adapters.json entry and pass it as a per-node extras override.
+quant = ["autoawq>=0.2", "gptqmodel>=1.0", "torch", "accelerate>=0.30"]
+
+[project.urls]
+Homepage = "https://capabilityhostprotocol.com"
+Issues = "https://github.com/capabilityhostprotocol/chp-core/issues"
+
+[project.entry-points."chp.adapters"]
+huggingface = "chp_adapter_huggingface:HuggingFaceAdapter"
+
+[tool.hatch.build.targets.wheel]
+packages = ["chp_adapter_huggingface"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+

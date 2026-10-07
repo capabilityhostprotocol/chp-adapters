@@ -1,0 +1,2092 @@
+"""HuggingFaceAdapter — governed local consumption of HuggingFace Hub artifacts.
+
+Pull models/datasets/tokenizers to local cache, run inference via transformers
+pipeline, embed text, tokenize, and audit local cache storage — all as
+evidence-producing CHP capability invocations.
+
+Evidence policy:
+  Emitted: repo_id, model name, task, token counts, latency, sizes, errors.
+  NOT emitted: raw text inputs, model outputs, embeddings, token IDs, dataset rows.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from chp_core import BaseAdapter, capability
+
+from ._backends import HFBackend, make_backend
+
+
+def _run_dir() -> str:
+    d = os.path.join(os.path.expanduser("~"), ".chp", "run")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _read_pid(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_pid(path: str, pid: int) -> None:
+    with open(path, "w") as f:
+        f.write(str(pid))
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(os.path.join(root, name))
+    return total
+
+
+def _tail_log(path: str, lines: int = 8, cap: int = 1000) -> str:
+    """Last few lines of a detached-pull log. A module helper (not a capability) — the governed I/O rule
+    targets capability bodies; pidfile/log bookkeeping for a detached job is local state, like _read_pid."""
+    try:
+        with open(path) as f:  # noqa: PTH123 — local job log, not governed content
+            return "".join(f.readlines()[-lines:])[-cap:]
+    except OSError:
+        return ""
+
+_EMITS = [
+    "hf_pull_started",
+    "hf_pull_completed",
+    "hf_pull_failed",
+    "hf_pull_status",
+    "hf_pipeline_started",
+    "hf_pipeline_completed",
+    "hf_pipeline_failed",
+    "hf_rerank_started",
+    "hf_rerank_completed",
+    "hf_rerank_failed",
+    "hf_embed_started",
+    "hf_embed_completed",
+    "hf_embed_failed",
+    "hf_tokenize_started",
+    "hf_tokenize_completed",
+    "hf_tokenize_failed",
+    "hf_dataset_started",
+    "hf_dataset_completed",
+    "hf_dataset_failed",
+    "hf_cache_scanned",
+    "hf_search_started",
+    "hf_search_completed",
+    "hf_search_failed",
+    "hf_model_card_started",
+    "hf_model_card_fetched",
+    "hf_model_card_failed",
+    "hf_pull_local_llm_started",
+    "hf_pull_local_llm_completed",
+    "hf_pull_local_llm_failed",
+    "hf_search_datasets_started",
+    "hf_search_datasets_completed",
+    "hf_search_datasets_failed",
+    "hf_search_spaces_started",
+    "hf_search_spaces_completed",
+    "hf_search_spaces_failed",
+    "hf_list_collections_started",
+    "hf_list_collections_completed",
+    "hf_list_collections_failed",
+    "hf_dataset_preview_started",
+    "hf_dataset_preview_completed",
+    "hf_dataset_preview_failed",
+    "hf_leaderboard_started",
+    "hf_leaderboard_completed",
+    "hf_leaderboard_failed",
+    "hf_evaluate_started",
+    "hf_evaluate_completed",
+    "hf_evaluate_failed",
+    "hf_apply_adapter_started",
+    "hf_apply_adapter_completed",
+    "hf_apply_adapter_failed",
+    "hf_merge_adapter_started",
+    "hf_merge_adapter_completed",
+    "hf_merge_adapter_failed",
+    "hf_call_space_started",
+    "hf_call_space_completed",
+    "hf_call_space_failed",
+    "hf_finetune_started",
+    "hf_finetune_completed",
+    "hf_finetune_failed",
+    "hf_quantize_started",
+    "hf_quantize_completed",
+    "hf_quantize_failed",
+    "hf_faiss_started",
+    "hf_faiss_completed",
+    "hf_faiss_failed",
+    "hf_transcribe_started",
+    "hf_transcribe_completed",
+    "hf_transcribe_failed",
+    "hf_classify_image_started",
+    "hf_classify_image_completed",
+    "hf_classify_image_failed",
+    "hf_generate_image_started",
+    "hf_generate_image_completed",
+    "hf_generate_image_failed",
+]
+
+
+@dataclass
+class HuggingFaceConfig:
+    token: str = ""
+    cache_dir: str = ""
+    datasets_cache_dir: str = ""
+    default_device: str = "cpu"
+    allow_remote_downloads: bool = True
+    _backend: Any = field(default=None, repr=False)
+
+    def resolved_token(self) -> str:
+        return self.token or os.environ.get("HF_TOKEN", "")
+
+    def resolved_cache_dir(self) -> str:
+        return self.cache_dir or os.path.expanduser("~/.cache/huggingface/hub")
+
+    def resolved_datasets_cache_dir(self) -> str:
+        return self.datasets_cache_dir or os.path.expanduser("~/.cache/huggingface/datasets")
+
+
+class HuggingFaceAdapter(BaseAdapter):
+    """Pull and use HuggingFace Hub artifacts locally with full evidence chains."""
+
+    adapter_id = "chp.adapters.huggingface"
+    adapter_name = "HuggingFace"
+    adapter_description = (
+        "Local consumption of HuggingFace Hub artifacts: pull models/datasets, "
+        "run transformers pipelines, embed text, tokenize, and audit local cache."
+    )
+    adapter_category = "ai"
+    adapter_tags = ["huggingface", "transformers", "nlp", "models", "datasets", "local"]
+
+    def __init__(self, config: HuggingFaceConfig | None = None) -> None:
+        self._config = config or HuggingFaceConfig()
+        self.__backend: HFBackend | None = None
+
+    async def _get_token(self, ctx: Any) -> str:
+        """Retrieve HF_TOKEN via secrets adapter (governed), falling back to config/env."""
+        if self._config.token:
+            return self._config.token
+        try:
+            result = await ctx.ainvoke("chp.adapters.secrets.get", {"key": "HF_TOKEN"})
+            if result.success and result.data.get("value"):
+                return result.data["value"]
+        except Exception:
+            pass
+        return os.environ.get("HF_TOKEN", "")
+
+    def _backend(self) -> HFBackend:
+        if self._config._backend is not None:
+            return self._config._backend
+        if self.__backend is None:
+            self.__backend = make_backend()
+        return self.__backend
+
+    # ------------------------------------------------------------------
+    # pull
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.pull",
+        version="1.0.0",
+        description="Download any HuggingFace Hub artifact (model, dataset, tokenizer) to local cache via snapshot_download.",
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "x-chp-representation": "hub_repo",  # transmutation-planner: consumes a Hub repo id
+            "properties": {
+                "repo_id": {"type": "string", "description": "Hub repo ID, e.g. 'bert-base-uncased'"},
+                "repo_type": {"type": "string", "enum": ["model", "dataset", "space"], "default": "model"},
+                "revision": {"type": "string", "description": "Branch, tag, or commit hash (default: main)"},
+                "allow_patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Glob patterns to limit which files are downloaded, e.g. ['*.safetensors', '*.json']",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Detached, RESUMABLE download for large models (10-40GB) that exceed the "
+                                   "governed invoke window. Returns immediately {state:pulling}; poll pull_status.",
+                },
+            },
+            "required": ["repo_id"],
+            "additionalProperties": False,
+        },
+        output_schema={  # transmutation-planner edge: hub_repo -> hf_dir
+            "type": "object", "x-chp-representation": "hf_dir", "x-chp-cost-s": 120.0,
+        },
+    )
+    async def pull(self, ctx: Any, payload: dict) -> dict:
+        repo_id: str = payload["repo_id"]
+        repo_type: str = payload.get("repo_type", "model")
+        revision: str | None = payload.get("revision")
+        allow_patterns: list[str] | None = payload.get("allow_patterns")
+
+        if not self._config.allow_remote_downloads:
+            raise RuntimeError(f"Remote downloads disabled (allow_remote_downloads=False). Pre-cache {repo_id} first.")
+
+        if payload.get("background"):
+            return self._pull_background(ctx, repo_id, repo_type, revision, allow_patterns,
+                                         await self._get_token(ctx))
+
+        ctx.emit("hf_pull_started", {
+            "repo_id": repo_id,
+            "repo_type": repo_type,
+            "revision": revision or "main",
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().pull,
+                repo_id,
+                repo_type,
+                revision,
+                allow_patterns,
+                await self._get_token(ctx),
+                self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_pull_failed", {
+                "repo_id": repo_id,
+                "repo_type": repo_type,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_pull_completed", {
+            "repo_id": repo_id,
+            "repo_type": repo_type,
+            "file_count": result["file_count"],
+            "size_bytes": result["size_bytes"],
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {
+            "repo_id": repo_id,
+            "repo_type": repo_type,
+            "cache_path": result["cache_path"],
+            "file_count": result["file_count"],
+            "size_bytes": result["size_bytes"],
+            "latency_ms": latency_ms,
+        }
+
+    def _pull_background(self, ctx: Any, repo_id: str, repo_type: str, revision: str | None,
+                        allow_patterns: list[str] | None, token: str | None) -> dict:
+        """Spawn a detached, RESUMABLE snapshot_download into the HF cache (so the cache_path matches a normal
+        pull and a serving container that mounts the cache finds the model). Returns immediately {state:pulling};
+        poll pull_status. A separate process is the only way a multi-GB download doesn't hold the invoke open."""
+        cache_dir = self._config.resolved_cache_dir()
+        tag = repo_id.replace("/", "__")
+        pidfile = os.path.join(_run_dir(), f"hf-pull-{tag}.pid")
+        log = os.path.join(_run_dir(), f"hf-pull-{tag}.log")
+        prior = _read_pid(pidfile)
+        if prior and _alive(prior):
+            return {"state": "pulling", "repo_id": repo_id, "pid": prior, "log": log, "note": "already running"}
+        code = ("import os\n"
+                "from huggingface_hub import snapshot_download\n"
+                "p = snapshot_download(repo_id=%r, repo_type=%r, cache_dir=%r, resume_download=True%s%s)\n"
+                "print('CACHE_PATH', p)\n"
+                % (repo_id, repo_type, cache_dir,
+                   (", revision=%r" % revision) if revision else "",
+                   (", allow_patterns=%r" % allow_patterns) if allow_patterns else ""))
+        env = dict(os.environ)
+        if token:
+            env["HF_TOKEN"] = token
+        logfd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            proc = subprocess.Popen([sys.executable, "-c", code], stdout=logfd, stderr=logfd,
+                                    start_new_session=True, env=env)
+        finally:
+            os.close(logfd)
+        _write_pid(pidfile, proc.pid)
+        ctx.emit("hf_pull_started", {"repo_id": repo_id, "repo_type": repo_type, "pid": proc.pid,
+                                     "background": True}, redacted=False)
+        return {"state": "pulling", "repo_id": repo_id, "pid": proc.pid, "log": log,
+                "note": "detached resumable download; poll chp.adapters.huggingface.pull_status"}
+
+    @capability(
+        id="chp.adapters.huggingface.pull_status",
+        version="1.0.0",
+        description="Poll a background hf.pull: whether the detached download for a repo is still running, how "
+                    "much has landed on disk, and a tail of its log. Low-risk introspection.",
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "The repo passed to hf.pull(background=true)."},
+            },
+            "required": ["repo_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def pull_status(self, ctx: Any, payload: dict) -> dict:
+        repo_id = payload["repo_id"]
+        tag = repo_id.replace("/", "__")
+        pidfile = os.path.join(_run_dir(), f"hf-pull-{tag}.pid")
+        log = os.path.join(_run_dir(), f"hf-pull-{tag}.log")
+        pid = _read_pid(pidfile)
+        running = bool(pid and _alive(pid))
+        cache_dir = self._config.resolved_cache_dir()
+        model_dir = os.path.join(cache_dir, f"models--{tag}")
+        size_bytes = _dir_size(model_dir) if os.path.isdir(model_dir) else 0
+        tail = _tail_log(log)
+        # complete when the process finished AND wrote a resolved CACHE_PATH line; else stopped/unknown/pulling
+        state = "pulling" if running else ("complete" if "CACHE_PATH" in tail else ("stopped" if pid else "unknown"))
+        ctx.emit("hf_pull_status", {"repo_id": repo_id, "state": state, "size_bytes": size_bytes}, redacted=False)
+        return {"repo_id": repo_id, "state": state, "running": running, "pid": pid,
+                "size_bytes": size_bytes, "size_gb": round(size_bytes / 1e9, 2), "log_tail": tail}
+
+    # ------------------------------------------------------------------
+    # run_pipeline
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.run_pipeline",
+        version="1.0.0",
+        description=(
+            "Run a transformers.pipeline() task on a locally-cached model. "
+            "Inputs and outputs are never recorded in evidence — only metadata."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "description": "Hub model ID or local cache path"},
+                "task": {
+                    "type": "string",
+                    "description": "Pipeline task, e.g. text-generation, text-classification, ner, summarization, question-answering, fill-mask, image-classification",
+                },
+                "inputs": {
+                    "description": "Input to the pipeline — string, list of strings, or dict (task-dependent)"
+                },
+                "device": {"type": "string", "description": "Device: cpu, cuda, cuda:N, mps, auto (default: config default_device)"},
+                "max_new_tokens": {"type": "integer", "minimum": 1, "maximum": 4096},
+            },
+            "required": ["model", "task", "inputs"],
+            "additionalProperties": False,
+        },
+    )
+    async def run_pipeline(self, ctx: Any, payload: dict) -> dict:
+        model: str = payload["model"]
+        task: str = payload["task"]
+        inputs = payload["inputs"]
+        device: str = payload.get("device") or self._config.default_device
+        kwargs: dict = {}
+        if payload.get("max_new_tokens"):
+            kwargs["max_new_tokens"] = payload["max_new_tokens"]
+
+        ctx.emit("hf_pipeline_started", {
+            "model": model,
+            "task": task,
+            "device": device,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().run_pipeline,
+                model,
+                task,
+                inputs,
+                device,
+                self._config.resolved_cache_dir(),
+                **kwargs,
+            )
+        except Exception as exc:
+            ctx.emit("hf_pipeline_failed", {
+                "model": model,
+                "task": task,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        output_count = len(result) if isinstance(result, list) else 1
+
+        ctx.emit("hf_pipeline_completed", {
+            "model": model,
+            "task": task,
+            "device": device,
+            "output_count": output_count,
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {
+            "model": model,
+            "task": task,
+            "device": device,
+            "result": result,
+            "output_count": output_count,
+            "latency_ms": latency_ms,
+        }
+
+    # ------------------------------------------------------------------
+    # embed
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.embed",
+        version="1.0.0",
+        description=(
+            "Generate text embeddings using a locally-cached feature-extraction model. "
+            "Vectors are returned but never stored in evidence."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "description": "Embedding model, e.g. 'sentence-transformers/all-MiniLM-L6-v2'"},
+                "texts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Texts to embed",
+                },
+                "pooling": {"type": "string", "enum": ["mean", "cls"], "default": "mean"},
+                "device": {"type": "string", "description": "Device: cpu, cuda, mps, auto"},
+            },
+            "required": ["model", "texts"],
+            "additionalProperties": False,
+        },
+    )
+    async def embed(self, ctx: Any, payload: dict) -> dict:
+        model: str = payload["model"]
+        texts: list[str] = payload["texts"]
+        pooling: str = payload.get("pooling", "mean")
+        device: str = payload.get("device") or self._config.default_device
+
+        ctx.emit("hf_embed_started", {
+            "model": model,
+            "text_count": len(texts),
+            "pooling": pooling,
+            "device": device,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            vectors = await asyncio.to_thread(
+                self._backend().embed,
+                model,
+                texts,
+                pooling,
+                device,
+                self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_embed_failed", {
+                "model": model,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        vector_dim = len(vectors[0]) if vectors else 0
+
+        ctx.emit("hf_embed_completed", {
+            "model": model,
+            "text_count": len(texts),
+            "vector_dim": vector_dim,
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {
+            "model": model,
+            "embeddings": vectors,
+            "vector_dim": vector_dim,
+            "text_count": len(texts),
+            "latency_ms": latency_ms,
+        }
+
+    # ------------------------------------------------------------------
+    # rerank
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.rerank",
+        version="1.0.0",
+        description=("Rerank documents by relevance to a query with a locally-cached cross-encoder "
+                     "(BAAI/bge-reranker-base default) — the rerank stage of two-stage retrieve→rerank. "
+                     "Returns results sorted by score desc (optional top_k). Query/doc text never in evidence."),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Query to rank documents against."},
+                "documents": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                              "description": "Candidate documents to rerank."},
+                "model": {"type": "string", "description": "Cross-encoder model (default BAAI/bge-reranker-base)."},
+                "top_k": {"type": "integer", "minimum": 1, "description": "Return only the top-k (default: all)."},
+                "device": {"type": "string", "description": "Device: cpu, cuda, mps, auto"},
+            },
+            "required": ["query", "documents"],
+            "additionalProperties": False,
+        },
+    )
+    async def rerank(self, ctx: Any, payload: dict) -> dict:
+        query: str = payload["query"]
+        documents: list[str] = payload["documents"]
+        model: str = payload.get("model") or "BAAI/bge-reranker-base"
+        top_k = payload.get("top_k")
+        device: str = payload.get("device") or self._config.default_device
+
+        ctx.emit("hf_rerank_started", {"model": model, "doc_count": len(documents), "top_k": top_k},
+                 redacted=False)
+        t0 = time.monotonic()
+        try:
+            scores = await asyncio.to_thread(self._backend().rerank, model, query, documents, device,
+                                             self._config.resolved_cache_dir())
+        except Exception as exc:
+            ctx.emit("hf_rerank_failed", {"model": model, "error": str(exc)[:500]}, redacted=False)
+            raise
+        ranked = sorted(({"index": i, "score": s} for i, s in enumerate(scores)),
+                        key=lambda r: r["score"], reverse=True)
+        if top_k:
+            ranked = ranked[:int(top_k)]
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_rerank_completed", {"model": model, "doc_count": len(documents),
+                                         "returned": len(ranked), "latency_ms": latency_ms}, redacted=False)
+        return {"model": model, "results": ranked, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # tokenize
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.tokenize",
+        version="1.0.0",
+        description="Encode text to token IDs or decode token IDs to text using a fast HuggingFace tokenizer. No full model load required.",
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "description": "Tokenizer model ID, e.g. 'gpt2' or 'bert-base-uncased'"},
+                "operation": {"type": "string", "enum": ["encode", "decode"], "default": "encode"},
+                "texts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Texts to encode (required for encode)",
+                },
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "integer"}},
+                    "description": "Token ID sequences to decode (required for decode)",
+                },
+            },
+            "required": ["model"],
+            "additionalProperties": False,
+        },
+    )
+    async def tokenize(self, ctx: Any, payload: dict) -> dict:
+        model: str = payload["model"]
+        operation: str = payload.get("operation", "encode")
+        texts: list[str] | None = payload.get("texts")
+        ids: list[list[int]] | None = payload.get("ids")
+
+        ctx.emit("hf_tokenize_started", {
+            "model": model,
+            "operation": operation,
+            "input_count": len(texts or ids or []),
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().tokenize,
+                model,
+                operation,
+                texts,
+                ids,
+                self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_tokenize_failed", {
+                "model": model,
+                "operation": operation,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+
+        ctx.emit("hf_tokenize_completed", {
+            "model": model,
+            "operation": operation,
+            "text_count": len(texts or ids or []),
+            "total_tokens": result.get("total_tokens", 0),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {**result, "model": model, "operation": operation, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # load_dataset
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.load_dataset",
+        version="1.0.0",
+        description=(
+            "Load rows from a HuggingFace dataset (Hub or local). "
+            "Streaming=true reads without downloading the full dataset. "
+            "Row content is returned but never stored in evidence."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "Hub dataset ID, e.g. 'squad' or 'imdb'"},
+                "split": {"type": "string", "default": "train", "description": "Dataset split (train, validation, test)"},
+                "streaming": {"type": "boolean", "default": True, "description": "Stream rows without downloading full dataset"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 100},
+                "columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Columns to include (default: all)",
+                },
+            },
+            "required": ["repo_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def load_dataset(self, ctx: Any, payload: dict) -> dict:
+        repo_id: str = payload["repo_id"]
+        split: str = payload.get("split", "train")
+        streaming: bool = payload.get("streaming", True)
+        limit: int = payload.get("limit", 100)
+        columns: list[str] | None = payload.get("columns")
+
+        ctx.emit("hf_dataset_started", {
+            "repo_id": repo_id,
+            "split": split,
+            "streaming": streaming,
+            "limit": limit,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().load_dataset,
+                repo_id,
+                split,
+                streaming,
+                limit,
+                columns,
+                await self._get_token(ctx),
+                self._config.resolved_datasets_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_dataset_failed", {
+                "repo_id": repo_id,
+                "split": split,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+
+        ctx.emit("hf_dataset_completed", {
+            "repo_id": repo_id,
+            "split": split,
+            "row_count": result["row_count"],
+            "columns": result["columns"],
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {**result, "repo_id": repo_id, "split": split, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # cache_info
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.cache_info",
+        version="1.0.0",
+        description="Scan the local HuggingFace cache and return a storage summary by artifact for governance and quota management.",
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    )
+    async def cache_info(self, ctx: Any, payload: dict) -> dict:
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().cache_info,
+                self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_cache_scanned", {
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+
+        ctx.emit("hf_cache_scanned", {
+            "repo_count": result["repo_count"],
+            "revision_count": result["revision_count"],
+            "total_size_bytes": result["total_size_bytes"],
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {**result, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # search_models
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.search_models",
+        version="1.0.0",
+        description=(
+            "Search HuggingFace Hub for models by task, sort, and filter. "
+            "Enables agents to discover models programmatically rather than hardcoding repo_ids."
+        ),
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Pipeline task to filter by, e.g. 'text-generation', 'text-classification', 'automatic-speech-recognition'",
+                },
+                "sort": {
+                    "type": "string",
+                    "enum": ["downloads", "likes", "lastModified", "createdAt"],
+                    "default": "downloads",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "filter": {
+                    "type": "string",
+                    "description": "Additional tag filter, e.g. 'gguf', 'quantized', 'en'",
+                },
+            },
+            "additionalProperties": False,
+        },
+    )
+    async def search_models(self, ctx: Any, payload: dict) -> dict:
+        task: str | None = payload.get("task")
+        sort: str = payload.get("sort", "downloads")
+        limit: int = payload.get("limit", 20)
+        filter_tag: str | None = payload.get("filter")
+
+        ctx.emit("hf_search_started", {
+            "task": task,
+            "sort": sort,
+            "limit": limit,
+            "filter": filter_tag,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            models = await asyncio.to_thread(
+                self._backend().search_models,
+                task,
+                sort,
+                limit,
+                filter_tag,
+                await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_search_failed", {
+                "task": task,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_search_completed", {
+            "task": task,
+            "sort": sort,
+            "result_count": len(models),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {
+            "models": models,
+            "result_count": len(models),
+            "task": task,
+            "sort": sort,
+            "latency_ms": latency_ms,
+        }
+
+    # ------------------------------------------------------------------
+    # model_card
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.model_card",
+        version="1.0.0",
+        description=(
+            "Fetch structured model metadata from HuggingFace Hub: license, pipeline task, "
+            "tags, gated status, author, and provenance. Governance gate before deploying any model."
+        ),
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "Hub repo ID, e.g. 'meta-llama/Llama-3.2-1B'"},
+            },
+            "required": ["repo_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def model_card(self, ctx: Any, payload: dict) -> dict:
+        repo_id: str = payload["repo_id"]
+
+        ctx.emit("hf_model_card_started", {
+            "repo_id": repo_id,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            info = await asyncio.to_thread(
+                self._backend().model_card,
+                repo_id,
+                await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_model_card_failed", {
+                "repo_id": repo_id,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_model_card_fetched", {
+            "repo_id": repo_id,
+            "pipeline_tag": info.get("pipeline_tag"),
+            "license": info.get("license"),
+            "gated": info.get("gated"),
+            "tag_count": len(info.get("tags", [])),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {**info, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # pull_for_local_llm
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.pull_for_local_llm",
+        version="1.0.0",
+        description=(
+            "Pull GGUF model files from HuggingFace Hub and return the local path ready "
+            "to pass directly to chp.adapters.local_llm. Closes the HF registry → llama.cpp loop."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "Hub repo with GGUF files, e.g. 'TheBloke/Llama-2-7B-GGUF'"},
+                "filename": {
+                    "type": "string",
+                    "description": "Specific GGUF filename to pull (e.g. 'llama-2-7b.Q4_K_M.gguf'). If omitted, pulls all *.gguf files.",
+                },
+            },
+            "required": ["repo_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def pull_for_local_llm(self, ctx: Any, payload: dict) -> dict:
+        repo_id: str = payload["repo_id"]
+        filename: str | None = payload.get("filename")
+
+        if not self._config.allow_remote_downloads:
+            raise RuntimeError(f"Remote downloads disabled. Pre-cache {repo_id} first.")
+
+        ctx.emit("hf_pull_local_llm_started", {
+            "repo_id": repo_id,
+            "filename": filename,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().pull_for_local_llm,
+                repo_id,
+                filename,
+                await self._get_token(ctx),
+                self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_pull_local_llm_failed", {
+                "repo_id": repo_id,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_pull_local_llm_completed", {
+            "repo_id": repo_id,
+            "file_count": result["file_count"],
+            "size_bytes": result["size_bytes"],
+            "has_recommended": result["recommended_path"] is not None,
+            "latency_ms": latency_ms,
+        }, redacted=False)
+
+        return {
+            "repo_id": repo_id,
+            "cache_path": result["cache_path"],
+            "gguf_files": result["gguf_files"],
+            "recommended_path": result["recommended_path"],
+            "file_count": result["file_count"],
+            "size_bytes": result["size_bytes"],
+            "latency_ms": latency_ms,
+        }
+
+    # ------------------------------------------------------------------
+    # search_datasets
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.search_datasets",
+        version="1.0.0",
+        description="Search HuggingFace Hub for datasets by task, sort, and filter. Symmetric to search_models — enables agents to discover datasets before loading them.",
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Task category to filter by, e.g. 'text-classification', 'question-answering'"},
+                "sort": {"type": "string", "enum": ["downloads", "likes", "lastModified", "createdAt"], "default": "downloads"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "filter": {"type": "string", "description": "Additional tag filter, e.g. 'en', 'multilingual'"},
+            },
+            "additionalProperties": False,
+        },
+    )
+    async def search_datasets(self, ctx: Any, payload: dict) -> dict:
+        task: str | None = payload.get("task")
+        sort: str = payload.get("sort", "downloads")
+        limit: int = payload.get("limit", 20)
+        filter_tag: str | None = payload.get("filter")
+
+        ctx.emit("hf_search_datasets_started", {"task": task, "sort": sort, "limit": limit, "filter": filter_tag}, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            datasets = await asyncio.to_thread(
+                self._backend().search_datasets, task, sort, limit, filter_tag, await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_search_datasets_failed", {"task": task, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_search_datasets_completed", {"task": task, "sort": sort, "result_count": len(datasets), "latency_ms": latency_ms}, redacted=False)
+        return {"datasets": datasets, "result_count": len(datasets), "task": task, "sort": sort, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # search_spaces
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.search_spaces",
+        version="1.0.0",
+        description="Search HuggingFace Hub for Spaces (Gradio/Streamlit apps) by SDK, sort, and filter. Precondition for call_space discovery.",
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "sdk": {"type": "string", "enum": ["gradio", "streamlit", "docker", "static"], "description": "Filter by Space SDK type"},
+                "sort": {"type": "string", "enum": ["likes", "lastModified", "createdAt"], "default": "likes"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "filter": {"type": "string", "description": "Tag filter, e.g. 'speech', 'vision', 'nlp'"},
+            },
+            "additionalProperties": False,
+        },
+    )
+    async def search_spaces(self, ctx: Any, payload: dict) -> dict:
+        sdk: str | None = payload.get("sdk")
+        sort: str = payload.get("sort", "likes")
+        limit: int = payload.get("limit", 20)
+        filter_tag: str | None = payload.get("filter")
+
+        ctx.emit("hf_search_spaces_started", {"sdk": sdk, "sort": sort, "limit": limit, "filter": filter_tag}, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            spaces = await asyncio.to_thread(
+                self._backend().search_spaces, sdk, sort, limit, filter_tag, await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_search_spaces_failed", {"sdk": sdk, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_search_spaces_completed", {"sdk": sdk, "sort": sort, "result_count": len(spaces), "latency_ms": latency_ms}, redacted=False)
+        return {"spaces": spaces, "result_count": len(spaces), "sdk": sdk, "sort": sort, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # list_collections
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.list_collections",
+        version="1.0.0",
+        description="List HuggingFace Hub Collections — curated groupings of models and datasets. Enables agents to navigate thematic clusters (e.g. 'Open LLM Leaderboard 2').",
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Filter by owner username or org, e.g. 'huggingface', 'open-llm-leaderboard'"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            },
+            "additionalProperties": False,
+        },
+    )
+    async def list_collections(self, ctx: Any, payload: dict) -> dict:
+        owner: str | None = payload.get("owner")
+        limit: int = payload.get("limit", 20)
+
+        ctx.emit("hf_list_collections_started", {"owner": owner, "limit": limit}, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            collections = await asyncio.to_thread(
+                self._backend().list_collections, owner, limit, await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_list_collections_failed", {"owner": owner, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_list_collections_completed", {"owner": owner, "result_count": len(collections), "latency_ms": latency_ms}, redacted=False)
+        return {"collections": collections, "result_count": len(collections), "owner": owner, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # dataset_preview
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.dataset_preview",
+        version="1.0.0",
+        description=(
+            "Preview the schema and first N rows of a HuggingFace dataset via the Dataset Viewer API — "
+            "no download required. Governance check before load_dataset. Row content returned but never stored in evidence."
+        ),
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "Hub dataset repo ID, e.g. 'squad', 'imdb'"},
+                "split": {"type": "string", "default": "train", "description": "Dataset split to preview"},
+                "config": {"type": "string", "description": "Dataset config/subset name (if required by dataset)"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 5},
+            },
+            "required": ["repo_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def dataset_preview(self, ctx: Any, payload: dict) -> dict:
+        repo_id: str = payload["repo_id"]
+        split: str = payload.get("split", "train")
+        config: str | None = payload.get("config")
+        limit: int = payload.get("limit", 5)
+
+        ctx.emit("hf_dataset_preview_started", {"repo_id": repo_id, "split": split, "limit": limit}, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().dataset_preview, repo_id, split, config, limit, await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_dataset_preview_failed", {"repo_id": repo_id, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_dataset_preview_completed", {
+            "repo_id": repo_id, "split": split, "row_count": result["row_count"],
+            "column_count": len(result["columns"]), "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "repo_id": repo_id, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # leaderboard_scores
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.leaderboard_scores",
+        version="1.0.0",
+        description=(
+            "Fetch evaluation benchmark scores for a model from HuggingFace Hub (MMLU, ARC, TruthfulQA, etc.). "
+            "Evidence-backed model selection before pull. Score values returned but not emitted in evidence."
+        ),
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "Hub model repo ID to fetch evaluation results for"},
+            },
+            "required": ["repo_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def leaderboard_scores(self, ctx: Any, payload: dict) -> dict:
+        repo_id: str = payload["repo_id"]
+
+        ctx.emit("hf_leaderboard_started", {"repo_id": repo_id}, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().leaderboard_scores, repo_id, await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_leaderboard_failed", {"repo_id": repo_id, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_leaderboard_completed", {
+            "repo_id": repo_id, "result_count": result["result_count"], "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # evaluate
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.evaluate",
+        version="1.0.0",
+        description=(
+            "Compute evaluation metrics (BLEU, ROUGE, accuracy, F1, exact_match) against ground-truth references. "
+            "Quality gate: score keys logged in evidence, predictions and references never emitted."
+        ),
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "metric": {"type": "string", "description": "Metric name: 'bleu', 'rouge', 'accuracy', 'f1', 'exact_match'"},
+                "predictions": {"type": "array", "items": {}, "description": "Model outputs — strings or ints"},
+                "references": {"type": "array", "items": {}, "description": "Ground-truth labels — strings or ints"},
+                "kwargs": {"type": "object", "description": "Extra metric parameters (e.g. tokenizer for BLEU)"},
+            },
+            "required": ["metric", "predictions", "references"],
+            "additionalProperties": False,
+        },
+    )
+    async def evaluate(self, ctx: Any, payload: dict) -> dict:
+        metric: str = payload["metric"]
+        predictions: list = payload["predictions"]
+        references: list = payload["references"]
+        kwargs: dict | None = payload.get("kwargs")
+
+        ctx.emit("hf_evaluate_started", {
+            "metric": metric,
+            "sample_count": len(predictions),
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().evaluate_metric, metric, predictions, references, kwargs,
+            )
+        except Exception as exc:
+            ctx.emit("hf_evaluate_failed", {"metric": metric, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_evaluate_completed", {
+            "metric": metric,
+            "score_keys": list(result.get("scores", {}).keys()),
+            "sample_count": len(predictions),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {
+            "metric": metric,
+            "scores": result["scores"],
+            "sample_count": len(predictions),
+            "latency_ms": latency_ms,
+        }
+
+    # ------------------------------------------------------------------
+    # apply_adapter
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.apply_adapter",
+        version="1.0.0",
+        description=(
+            "Download a LoRA/PEFT adapter from HuggingFace Hub and inspect its configuration. "
+            "Returns the local adapter path ready for inference. No full base-model load required."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "base_model": {"type": "string", "description": "Base model the adapter targets, e.g. 'meta-llama/Llama-3.2-1B'"},
+                "adapter_repo_id": {"type": "string", "description": "Hub PEFT adapter repo ID, e.g. 'org/llama-3-1b-lora'"},
+            },
+            "required": ["base_model", "adapter_repo_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def apply_adapter(self, ctx: Any, payload: dict) -> dict:
+        base_model: str = payload["base_model"]
+        adapter_repo_id: str = payload["adapter_repo_id"]
+
+        ctx.emit("hf_apply_adapter_started", {
+            "base_model": base_model,
+            "adapter_repo_id": adapter_repo_id,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().apply_adapter,
+                base_model,
+                adapter_repo_id,
+                self._config.resolved_cache_dir(),
+                await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_apply_adapter_failed", {
+                "adapter_repo_id": adapter_repo_id,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_apply_adapter_completed", {
+            "adapter_repo_id": adapter_repo_id,
+            "peft_type": result.get("peft_type"),
+            "base_model_name": result.get("base_model_name"),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # merge_adapter — the loop's MERGE step on the CUDA route
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.merge_adapter",
+        version="1.0.0",
+        description=(
+            "Merge a PEFT LoRA adapter (local dir from a QLoRA fine-tune, or a hub id) back INTO "
+            "the base weights via merge_and_unload, saving a standalone model at output_dir with its "
+            "tokenizer + chat template — the loop's MERGE step. Feed output_dir to quantize_to_gguf "
+            "then home.model.import (ollama create) to serve the tuned model. Paths logged; weights "
+            "never emitted."
+        ),
+        category="ai",
+        provider="huggingface",
+        risk="medium",
+        side_effects=["model_write"],
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "x-chp-representation": "lora_adapter",  # transmutation-planner: consumes a LoRA adapter
+            "x-chp-requires": ["hf_dir"],            # ...with the base model available
+            "properties": {
+                "base_model": {"type": "string", "description": "Base model the LoRA was trained on."},
+                "adapter_path": {"type": "string", "description": "LoRA adapter — local dir (from a fine-tune) or a hub repo id."},
+                "output_dir": {"type": "string", "description": "Output dir for the merged standalone model."},
+            },
+            "required": ["base_model", "adapter_path", "output_dir"],
+            "additionalProperties": False,
+        },
+        output_schema={  # transmutation-planner edge: lora_adapter (+hf_dir) -> hf_dir
+            "type": "object", "x-chp-representation": "hf_dir",
+            "x-chp-loss": 0.02, "x-chp-cost-s": 90.0,
+        },
+    )
+    async def merge_adapter(self, ctx: Any, payload: dict) -> dict:
+        base_model: str = payload["base_model"]
+        adapter_path: str = payload["adapter_path"]
+        output_dir: str = payload["output_dir"]
+
+        ctx.emit("hf_merge_adapter_started", {
+            "base_model": base_model,
+            "adapter_path": adapter_path,
+            "output_dir": output_dir,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().merge_adapter,
+                base_model,
+                adapter_path,
+                output_dir,
+                self._config.resolved_cache_dir(),
+                await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_merge_adapter_failed", {
+                "adapter_path": adapter_path,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_merge_adapter_completed", {
+            "output_dir": output_dir,
+            "base_model": base_model,
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # call_space
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.call_space",
+        version="1.0.0",
+        description=(
+            "Invoke any HuggingFace Gradio Space as a governed CHP capability via gradio_client. "
+            "Space ID, api_name, and latency logged in evidence. Inputs and outputs never emitted."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "space_id": {"type": "string", "description": "Hub Space ID, e.g. 'stabilityai/stable-diffusion'"},
+                "api_name": {"type": "string", "default": "/predict", "description": "Gradio API endpoint name"},
+                "inputs": {"description": "Positional inputs — single value or list"},
+            },
+            "required": ["space_id", "inputs"],
+            "additionalProperties": False,
+        },
+    )
+    async def call_space(self, ctx: Any, payload: dict) -> dict:
+        space_id: str = payload["space_id"]
+        api_name: str = payload.get("api_name", "/predict")
+        inputs = payload["inputs"]
+
+        ctx.emit("hf_call_space_started", {
+            "space_id": space_id,
+            "api_name": api_name,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().call_space,
+                space_id,
+                api_name,
+                inputs,
+                await self._get_token(ctx),
+            )
+        except Exception as exc:
+            ctx.emit("hf_call_space_failed", {
+                "space_id": space_id,
+                "api_name": api_name,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_call_space_completed", {
+            "space_id": space_id,
+            "api_name": api_name,
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {
+            "space_id": space_id,
+            "api_name": api_name,
+            "result": result,
+            "latency_ms": latency_ms,
+        }
+
+    # ------------------------------------------------------------------
+    # finetune
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.finetune",
+        version="1.0.0",
+        description=(
+            "Fine-tune a model locally. task_type='text-classification' (transformers.Trainer), "
+            "'causal-lm' (the GPU route: 4-bit NF4 QLoRA via TRL SFTTrainer + PEFT LoRA over a text "
+            "field → saves a LoRA adapter that feeds merge_adapter→quantize_to_gguf→import), or 'grpo' "
+            "(RLVR: TRL GRPOTrainer samples num_generations completions per prompt and optimises toward "
+            "a verifiable reward — the reward is a governed CHP invocation of reward_cap (default "
+            "chp.adapters.eval.verify) per completion, so RL reward lands in the signed evidence chain). "
+            "Causal-LM/GRPO 4-bit needs a CUDA GPU (else set load_in_4bit=false, or use mlx.finetune on "
+            "Apple Silicon). Governance: model, dataset, hyperparameters, and final loss logged; no "
+            "training content or weights emitted."
+        ),
+        category="ai",
+        risk="high",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "description": "Base model to fine-tune (classification: 'distilbert-base-uncased'; causal-lm: e.g. 'Qwen/Qwen3-8B')"},
+                "dataset_repo_id": {"type": "string", "description": "Hub dataset for training, e.g. 'imdb' (or use inline 'dataset' for causal-lm)"},
+                "dataset": {"type": "array", "items": {"type": "object"},
+                            "description": "causal-lm: inline training records (each with the text field) — train on mesh data with no Hub dataset"},
+                "output_dir": {"type": "string", "description": "Local path to save the fine-tuned model / LoRA adapter"},
+                "task_type": {"type": "string", "enum": ["text-classification", "causal-lm", "grpo", "rl"], "default": "text-classification"},
+                "num_epochs": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+                "batch_size": {"type": "integer", "minimum": 1, "maximum": 64, "default": 8},
+                "learning_rate": {"type": "number", "minimum": 1e-7, "maximum": 0.1, "default": 5e-5},
+                "max_steps": {"type": "integer", "minimum": 1, "description": "Override num_epochs with a fixed step count"},
+                "text_field": {"type": "string", "description": "causal-lm: dataset column holding the training text (default: text/content/prompt)"},
+                "load_in_4bit": {"type": "boolean", "description": "causal-lm: 4-bit NF4 QLoRA (default true; needs CUDA)"},
+                "lora_r": {"type": "integer", "minimum": 1, "maximum": 256, "description": "causal-lm: LoRA rank (default 16)"},
+                "lora_alpha": {"type": "integer", "minimum": 1, "description": "causal-lm: LoRA alpha (default 32)"},
+                "lora_dropout": {"type": "number", "minimum": 0, "maximum": 1, "description": "causal-lm: LoRA dropout (default 0.05)"},
+                "max_seq_len": {"type": "integer", "minimum": 1, "description": "causal-lm: max sequence length (default 1024)"},
+                "reward_cap": {"type": "string", "description": "grpo: reward capability invoked per completion (default chp.adapters.eval.verify)"},
+                "reward_mode": {"type": "string", "enum": ["verifiable", "judge"], "description": "grpo: reward_cap mode (default verifiable)"},
+                "reference_field": {"type": "string", "description": "grpo: dataset column holding each prompt's reference answer, passed to the reward (default 'reference')"},
+                "reward_options": {"type": "object", "description": "grpo: extra params forwarded to reward_cap (e.g. match, threshold, rubric, judge_cap)"},
+                "prompt_field": {"type": "string", "description": "grpo: dataset column holding the prompt (default: prompt/question/text)"},
+                "num_generations": {"type": "integer", "minimum": 2, "maximum": 64, "description": "grpo: completions sampled per prompt (default 4)"},
+                "max_completion_length": {"type": "integer", "minimum": 1, "description": "grpo: max tokens per sampled completion (default 256)"},
+            },
+            "required": ["model", "output_dir"],
+            "additionalProperties": False,
+        },
+    )
+    async def finetune(self, ctx: Any, payload: dict) -> dict:
+        model: str = payload["model"]
+        dataset_repo_id: str = payload.get("dataset_repo_id") or ""
+        output_dir: str = payload["output_dir"]
+        if not dataset_repo_id and not payload.get("dataset"):
+            raise ValueError("finetune needs a dataset_repo_id (Hub) or an inline 'dataset' (records)")
+        task_type: str = payload.get("task_type", "text-classification")
+        num_epochs: int = payload.get("num_epochs", 3)
+        batch_size: int = payload.get("batch_size", 8)
+        learning_rate: float = payload.get("learning_rate", 5e-5)
+        max_steps: int | None = payload.get("max_steps")
+        # causal-lm QLoRA + grpo knobs (each path ignores the others' knobs)
+        options = {k: payload[k] for k in
+                   ("text_field", "load_in_4bit", "lora_r", "lora_alpha", "lora_dropout",
+                    "max_seq_len", "dataset", "prompt_field", "num_generations",
+                    "max_completion_length")
+                   if k in payload}
+
+        # grpo/rl: build the verifiable-reward callback in this async layer (it holds ctx + the loop),
+        # bridging each completion to a governed CHP reward cap — the training backend stays pure.
+        reward_fn = None
+        if task_type in ("grpo", "rl"):
+            loop = asyncio.get_running_loop()
+            reward_cap: str = payload.get("reward_cap", "chp.adapters.eval.verify")
+            reward_mode: str = payload.get("reward_mode", "verifiable")
+            reference_field: str = payload.get("reference_field", "reference")
+            reward_extra: dict = payload.get("reward_options") or {}
+
+            def _completion_text(comp: Any) -> str:
+                if isinstance(comp, str):
+                    return comp
+                if isinstance(comp, list) and comp:   # conversational: [{role, content}, …]
+                    last = comp[-1]
+                    return last.get("content", "") if isinstance(last, dict) else str(last)
+                return str(comp)
+
+            def _reward(completions: list, **cols: Any) -> list[float]:
+                refs = cols.get(reference_field) or [None] * len(completions)
+                scores: list[float] = []
+                for comp, ref in zip(completions, refs):
+                    vp = {"output": _completion_text(comp), "mode": reward_mode, **reward_extra}
+                    if ref is not None:
+                        vp["reference"] = ref
+                    # same bridge as the smolagents tool wall: govern the reward from the trainer thread
+                    res = asyncio.run_coroutine_threadsafe(ctx.ainvoke(reward_cap, vp), loop).result()
+                    ok = getattr(res, "success", False)
+                    scores.append(float(res.data.get("score", 0.0)) if ok else 0.0)
+                return scores
+
+            reward_fn = _reward
+
+        ctx.emit("hf_finetune_started", {
+            "model": model,
+            "dataset": dataset_repo_id,
+            "task_type": task_type,
+            "num_epochs": num_epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "max_steps": max_steps,
+            # never emit the inline dataset (training content) — only its shape
+            "options": {**{k: v for k, v in options.items() if k != "dataset"},
+                        "dataset_records": len(options["dataset"]) if "dataset" in options else 0},
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().finetune,
+                model,
+                dataset_repo_id,
+                output_dir,
+                task_type,
+                num_epochs,
+                batch_size,
+                learning_rate,
+                max_steps,
+                self._config.resolved_cache_dir(),
+                await self._get_token(ctx),
+                options,
+                reward_fn,
+            )
+        except Exception as exc:
+            ctx.emit("hf_finetune_failed", {
+                "model": model,
+                "dataset": dataset_repo_id,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_finetune_completed", {
+            "model": model,
+            "dataset": dataset_repo_id,
+            "output_dir": result.get("output_dir"),
+            "steps": result.get("steps"),
+            "final_loss": result.get("final_loss"),
+            # the measured ARPO/RL signal lands in signed evidence: start→end reward + delta
+            "reward_start": result.get("reward_start"),
+            "reward_end": result.get("reward_end"),
+            "reward_delta": result.get("reward_delta"),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # quantize_to_gguf
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.quantize_to_gguf",
+        version="1.0.0",
+        description=(
+            "Convert a local HuggingFace model directory to quantized GGUF using llama.cpp tools. "
+            "Two-step: convert_hf_to_gguf.py → f16 GGUF, then llama-quantize → target type. "
+            "Output path feeds directly into local_llm adapter."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "x-chp-representation": "hf_dir",  # transmutation-planner: consumes a local HF model dir
+            "properties": {
+                "model_path": {"type": "string", "description": "Local HuggingFace model directory (output of pull capability)"},
+                "output_path": {"type": "string", "description": "Destination .gguf file path"},
+                "quantization": {"type": "string", "default": "Q4_K_M", "description": "Quantization type: Q4_K_M, Q8_0, Q4_0, Q2_K, Q5_K_M, Q6_K"},
+                "convert_script": {"type": "string", "description": "Path to convert_hf_to_gguf.py (auto-detected from Homebrew if omitted)"},
+                "quantize_bin": {"type": "string", "description": "Path to llama-quantize binary (auto-detected from Homebrew if omitted)"},
+            },
+            "required": ["model_path", "output_path"],
+            "additionalProperties": False,
+        },
+        output_schema={  # transmutation-planner edge: hf_dir -> gguf
+            "type": "object", "x-chp-representation": "gguf",
+            "x-chp-loss": 0.15, "x-chp-cost-s": 180.0,
+        },
+    )
+    async def quantize_to_gguf(self, ctx: Any, payload: dict) -> dict:
+        model_path: str = payload["model_path"]
+        output_path: str = payload["output_path"]
+        quantization: str = payload.get("quantization", "Q4_K_M")
+        convert_script: str | None = payload.get("convert_script")
+        quantize_bin: str | None = payload.get("quantize_bin")
+
+        ctx.emit("hf_quantize_started", {
+            "model_path": model_path,
+            "output_path": output_path,
+            "quantization": quantization,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().quantize_to_gguf,
+                model_path,
+                output_path,
+                quantization,
+                convert_script,
+                quantize_bin,
+            )
+        except Exception as exc:
+            ctx.emit("hf_quantize_failed", {
+                "model_path": model_path,
+                "quantization": quantization,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_quantize_completed", {
+            "output_path": result.get("output_path"),
+            "quantization": quantization,
+            "input_size_bytes": result.get("input_size_bytes"),
+            "output_size_bytes": result.get("output_size_bytes"),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # quantize (AWQ / GPTQ — GPU-serving formats)
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.quantize",
+        version="1.0.0",
+        description=(
+            "Quantize a local HF model to GPTQ/AWQ (int4) — the GPU-serving format vLLM loads natively — "
+            "completing quant breadth beyond GGUF (llama.cpp/CPU) and MLX (Apple Silicon). Output is a "
+            "vLLM-loadable model directory. Two execution paths: execution='in_process' imports the quant "
+            "lib in the node's env (needs the [quant] extra); execution='container' composes "
+            "chp.adapters.container.run against a prebuilt CUDA image (default chp-quant:gptq) with GPU "
+            "passthrough — for GPU nodes where the libs can't be installed (e.g. a Windows node without "
+            "MSVC). method=gptq is the maintained path (autoawq is deprecated / unimportable on 2026 "
+            "transformers). Pass domain-representative `calibration` text for best accuracy. Redacted: "
+            "model weights + calibration text never reach evidence — only method, bits, group_size, size."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "x-chp-representation": "hf_dir",  # transmutation-planner: consumes a local HF model dir
+            "properties": {
+                "model_path": {"type": "string", "description": "Local HF model dir (in_process/container-mounted) OR an HF repo id (container pulls it)."},
+                "output_path": {"type": "string", "description": "Destination directory for the quantized model (host path; mounted into the container)."},
+                "method": {"type": "string", "enum": ["awq", "gptq"], "default": "gptq", "description": "Quantization format. gptq is maintained; awq (autoawq) is deprecated."},
+                "bits": {"type": "integer", "enum": [4, 8], "default": 4},
+                "group_size": {"type": "integer", "default": 128, "description": "Weight grouping (128 is standard)."},
+                "calibration": {"type": "array", "items": {"type": "string"}, "description": "Calibration text samples (defaults to a generic set; pass domain text for quality)."},
+                "execution": {"type": "string", "enum": ["in_process", "container"], "default": "in_process", "description": "in_process=import libs in the node env; container=run in a CUDA container via the container adapter."},
+                "container_image": {"type": "string", "description": "Image for execution=container (default chp-quant:gptq)."},
+                "gpus": {"type": "string", "description": "GPU passthrough for execution=container (default 'all')."},
+                "container_timeout": {"type": "integer", "minimum": 60, "description": "Max container run seconds for execution=container (default 1800) — quantize must not be cut short."},
+            },
+            "required": ["model_path", "output_path"],
+            "additionalProperties": False,
+        },
+        output_schema={  # transmutation-planner edge: hf_dir -> quantized GPU dir
+            "type": "object", "x-chp-representation": "awq_dir",
+            "x-chp-loss": 0.15, "x-chp-cost-s": 600.0,
+        },
+    )
+    async def quantize(self, ctx: Any, payload: dict) -> dict:
+        model_path: str = payload["model_path"]
+        output_path: str = payload["output_path"]
+        method: str = payload.get("method", "gptq")
+        bits: int = int(payload.get("bits", 4))
+        group_size: int = int(payload.get("group_size", 128))
+        calibration: list | None = payload.get("calibration")
+        execution: str = payload.get("execution") or "in_process"
+
+        ctx.emit("hf_quantize_started", {
+            "model_path": model_path, "output_path": output_path, "execution": execution,
+            "method": method, "bits": bits, "group_size": group_size,
+            "calibration_n": len(calibration) if calibration else 0,  # count only — text redacted
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            if execution == "container":
+                result = await self._quantize_in_container(
+                    ctx, model_path=model_path, output_path=output_path, method=method,
+                    bits=bits, group_size=group_size, calibration=calibration,
+                    image=payload.get("container_image") or "chp-quant:gptq",
+                    gpus=payload.get("gpus") or "all",
+                    timeout=int(payload.get("container_timeout") or 1800))
+            else:
+                result = await asyncio.to_thread(
+                    self._backend().quantize,
+                    model_path, output_path, method, bits, group_size, calibration,
+                )
+        except Exception as exc:
+            ctx.emit("hf_quantize_failed", {
+                "model_path": model_path, "method": method, "execution": execution,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_quantize_completed", {
+            "output_path": result.get("output_path"), "method": method, "bits": bits,
+            "execution": execution,
+            "output_size_bytes": result.get("output_size_bytes"), "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "latency_ms": latency_ms}
+
+    async def _quantize_in_container(self, ctx: Any, *, model_path: str, output_path: str,
+                                     method: str, bits: int, group_size: int,
+                                     calibration: list | None, image: str, gpus: str,
+                                     timeout: int = 1800) -> dict:
+        """Run the quantize in a prebuilt CUDA container via the governed container adapter — for GPU
+        nodes where the quant libs can't be installed. The image's entrypoint (python /quantize.py) takes
+        --model/--out/--method/--bits/--group-size and prints ``CHP_QUANTIZE_RESULT <json>``. The output
+        dir is bind-mounted; a local model dir is mounted read-only; an HF repo id is pulled in-container.
+        Calibration text is written into the mounted dir via the governed filesystem cap (never in argv/evidence)."""
+        import json as _json
+
+        cmd = ["--model", model_path, "--out", "/work/out",
+               "--method", method, "--bits", str(bits), "--group-size", str(group_size)]
+        volumes = [f"{output_path}:/work/out"]
+        if os.path.isabs(model_path) and os.path.isdir(model_path):
+            volumes.append(f"{model_path}:/model:ro")
+            cmd[1] = "/model"                      # mount the local model, don't pull
+        if calibration:                            # write via the filesystem cap → visible in the mount
+            await ctx.ainvoke("chp.adapters.filesystem.write_file", {
+                "path": os.path.join(output_path, ".calib.txt"),
+                "content": "\n".join(str(c) for c in calibration)})
+            cmd += ["--calib-file", "/work/out/.calib.txt"]
+
+        res = await ctx.ainvoke("chp.adapters.container.run", {
+            "image": image, "gpus": gpus, "detach": False, "remove": True,
+            "volumes": volumes, "command": cmd, "timeout": timeout})
+        rc = (getattr(res, "data", None) or {}).get("exit_code")
+        if not getattr(res, "success", False) or (rc not in (None, 0)):
+            raise RuntimeError(f"quantize container failed (exit={rc}): {getattr(res, 'error', '')}")
+
+        # Source of truth is the result FILE the entrypoint wrote into the mounted output dir — the
+        # quantizer's progress output can head-truncate the captured stdout past the trailing marker.
+        try:
+            fres = await ctx.ainvoke("chp.adapters.filesystem.read_file",
+                                     {"path": os.path.join(output_path, ".chp_result.json")})
+            content = (getattr(fres, "data", None) or {}).get("content")
+            if content:
+                return _json.loads(content)
+        except Exception:  # noqa: BLE001 — fall back to stdout if the file read is unavailable
+            pass
+        stdout = (getattr(res, "data", None) or {}).get("stdout") or ""
+        marker = "CHP_QUANTIZE_RESULT "
+        idx = stdout.rfind(marker)
+        if idx < 0:
+            raise RuntimeError(
+                f"quantize container exited {rc} but produced no result file or marker: ...{stdout[-300:]}")
+        return _json.loads(stdout[idx + len(marker):].splitlines()[0])
+
+    # ------------------------------------------------------------------
+    # faiss_index
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.faiss_index",
+        version="1.0.0",
+        description=(
+            "Build or search a FAISS cosine-similarity index for RAG pipelines. "
+            "'build': creates IndexFlatIP from float embeddings, saves to disk. "
+            "'search': loads index, returns top-K nearest indices and scores. "
+            "Vector content never emitted in evidence."
+        ),
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["build", "search"]},
+                "index_path": {"type": "string", "description": "Path to save (build) or load (search) the FAISS index"},
+                "embeddings": {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "number"}},
+                    "description": "Float embedding matrix (required for build)",
+                },
+                "query": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Query vector (required for search)",
+                },
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 5},
+            },
+            "required": ["operation", "index_path"],
+            "additionalProperties": False,
+        },
+    )
+    async def faiss_index(self, ctx: Any, payload: dict) -> dict:
+        operation: str = payload["operation"]
+        index_path: str = payload["index_path"]
+        embeddings: list | None = payload.get("embeddings")
+        query: list | None = payload.get("query")
+        top_k: int = payload.get("top_k", 5)
+        dimension: int | None = len(embeddings[0]) if embeddings else None
+
+        ctx.emit("hf_faiss_started", {
+            "operation": operation,
+            "index_path": index_path,
+            "vector_count": len(embeddings) if embeddings else None,
+            "top_k": top_k if operation == "search" else None,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().faiss_index,
+                operation,
+                embeddings,
+                index_path,
+                query,
+                top_k,
+                dimension,
+            )
+        except Exception as exc:
+            ctx.emit("hf_faiss_failed", {
+                "operation": operation,
+                "index_path": index_path,
+                "error": str(exc)[:500],
+            }, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_faiss_completed", {
+            "operation": operation,
+            "index_path": result.get("index_path", index_path),
+            "vector_count": result.get("vector_count"),
+            "top_k": result.get("top_k"),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # transcribe_audio
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.transcribe_audio",
+        version="1.0.0",
+        description=(
+            "Transcribe an audio file to text using a Whisper ASR pipeline. Input is a local "
+            "file path (e.g. from the filesystem adapter). The transcript is returned but never "
+            "recorded in evidence — only model, language, segment count, and latency."
+        ),
+        category="ai",
+        risk="medium",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "x-chp-representation": "audio",  # transmutation-planner: consumes an audio file
+            "properties": {
+                "audio_path": {"type": "string", "description": "Local path to the audio file"},
+                "model": {"type": "string", "default": "openai/whisper-base", "description": "ASR model id"},
+                "language": {"type": "string", "description": "Force a transcription language (e.g. 'english'); omit for auto-detect"},
+                "device": {"type": "string", "description": "Device: cpu, mps, cuda, auto"},
+            },
+            "required": ["audio_path"],
+            "additionalProperties": False,
+        },
+        output_schema={  # transmutation-planner edge: audio -> text
+            "type": "object", "x-chp-representation": "text",
+            "x-chp-loss": 0.1, "x-chp-cost-s": 30.0,
+        },
+    )
+    async def transcribe_audio(self, ctx: Any, payload: dict) -> dict:
+        audio_path: str = payload["audio_path"]
+        model: str = payload.get("model", "openai/whisper-base")
+        language: str | None = payload.get("language")
+        device: str = payload.get("device") or self._config.default_device
+
+        ctx.emit("hf_transcribe_started", {"model": model, "language": language, "device": device}, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().transcribe_audio,
+                audio_path, model, language, device, self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_transcribe_failed", {"model": model, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_transcribe_completed", {
+            "model": model,
+            "language": result.get("language"),
+            "segment_count": result.get("segment_count"),
+            "char_count": result.get("char_count"),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "model": model, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # classify_image
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.classify_image",
+        version="1.0.0",
+        description=(
+            "Classify an image with a ViT/DeiT image-classification pipeline. Input is a local "
+            "image path. Top-N labels and scores are returned but not recorded in evidence — "
+            "only model, prediction count, and latency."
+        ),
+        category="ai",
+        risk="low",
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "x-chp-representation": "image",  # transmutation-planner: consumes an image
+            "properties": {
+                "image_path": {"type": "string", "description": "Local path to the image file"},
+                "model": {"type": "string", "default": "google/vit-base-patch16-224", "description": "Image-classification model id"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 5},
+                "device": {"type": "string", "description": "Device: cpu, mps, cuda, auto"},
+            },
+            "required": ["image_path"],
+            "additionalProperties": False,
+        },
+        output_schema={  # transmutation-planner edge: image -> text (labels)
+            "type": "object", "x-chp-representation": "text",
+            "x-chp-loss": 0.3, "x-chp-cost-s": 10.0,
+        },
+    )
+    async def classify_image(self, ctx: Any, payload: dict) -> dict:
+        image_path: str = payload["image_path"]
+        model: str = payload.get("model", "google/vit-base-patch16-224")
+        top_k: int = payload.get("top_k", 5)
+        device: str = payload.get("device") or self._config.default_device
+
+        ctx.emit("hf_classify_image_started", {"model": model, "top_k": top_k, "device": device}, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().classify_image,
+                image_path, model, top_k, device, self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_classify_image_failed", {"model": model, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_classify_image_completed", {
+            "model": model,
+            "prediction_count": result.get("prediction_count"),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "model": model, "latency_ms": latency_ms}
+
+    # ------------------------------------------------------------------
+    # generate_image
+    # ------------------------------------------------------------------
+
+    @capability(
+        id="chp.adapters.huggingface.generate_image",
+        version="1.0.0",
+        description=(
+            "Generate an image from a text prompt via a diffusers DiffusionPipeline (Stable "
+            "Diffusion, etc.) and save it to a local path. The prompt and image bytes are never "
+            "recorded in evidence — only model, steps, seed, output dimensions, and latency."
+        ),
+        category="ai",
+        risk="medium",
+        side_effects=["file_write"],
+        emits=_EMITS,
+        input_schema={
+            "type": "object",
+            "x-chp-representation": "text",  # transmutation-planner: consumes a text prompt
+            "properties": {
+                "prompt": {"type": "string", "minLength": 1, "description": "Text prompt for image generation"},
+                "output_path": {"type": "string", "description": "Local path to save the generated image (e.g. /tmp/out.png)"},
+                "model": {"type": "string", "default": "stabilityai/sd-turbo", "description": "Diffusers model id"},
+                "num_inference_steps": {"type": "integer", "minimum": 1, "maximum": 150, "default": 4},
+                "guidance_scale": {"type": "number", "minimum": 0.0, "maximum": 20.0, "default": 0.0},
+                "seed": {"type": "integer", "description": "Random seed for reproducibility"},
+                "device": {"type": "string", "description": "Device: cpu, mps, cuda, auto"},
+            },
+            "required": ["prompt", "output_path"],
+            "additionalProperties": False,
+        },
+        output_schema={  # transmutation-planner edge: text -> image
+            "type": "object", "x-chp-representation": "image",
+            "x-chp-loss": 0.2, "x-chp-cost-s": 20.0,
+        },
+    )
+    async def generate_image(self, ctx: Any, payload: dict) -> dict:
+        prompt: str = payload["prompt"]
+        output_path: str = payload["output_path"]
+        model: str = payload.get("model", "stabilityai/sd-turbo")
+        steps: int = payload.get("num_inference_steps", 4)
+        guidance: float = payload.get("guidance_scale", 0.0)
+        seed: int | None = payload.get("seed")
+        device: str = payload.get("device") or self._config.default_device
+
+        ctx.emit("hf_generate_image_started", {
+            "model": model, "steps": steps, "seed": seed, "device": device,
+        }, redacted=False)
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._backend().generate_image,
+                prompt, model, steps, guidance, seed, output_path, device, self._config.resolved_cache_dir(),
+            )
+        except Exception as exc:
+            ctx.emit("hf_generate_image_failed", {"model": model, "error": str(exc)[:500]}, redacted=False)
+            raise
+
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        ctx.emit("hf_generate_image_completed", {
+            "model": model,
+            "steps": result.get("steps"),
+            "seed": result.get("seed"),
+            "width": result.get("width"),
+            "height": result.get("height"),
+            "output_path": result.get("output_path"),
+            "latency_ms": latency_ms,
+        }, redacted=False)
+        return {**result, "model": model, "latency_ms": latency_ms}

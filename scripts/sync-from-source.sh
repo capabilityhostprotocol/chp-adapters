@@ -19,6 +19,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PUBLIC_ADAPTERS=(
   chp-adapter-safety
   chp-adapter-audit
+  chp-adapter-http
+  chp-adapter-filesystem
+  chp-adapter-github
+  chp-adapter-radicle
+  chp-adapter-process
+  chp-adapter-composition
+  chp-adapter-planning
+  chp-adapter-jobs
+  chp-adapter-mlx
+  chp-adapter-delegation
+  chp-adapter-mcp
+  chp-adapter-huggingface
+  chp-adapter-git
+  chp-adapter-host
+  chp-adapter-conformance
 )
 
 [ -d "$SRC" ] || { echo "chp-dev packages not found at $SRC (set CHP_DEV_ROOT)"; exit 2; }
