@@ -34,6 +34,7 @@ PUBLIC_ADAPTERS=(
   chp-adapter-git
   chp-adapter-host
   chp-adapter-conformance
+  chp-safety-case
 )
 
 [ -d "$SRC" ] || { echo "chp-dev packages not found at $SRC (set CHP_DEV_ROOT)"; exit 2; }

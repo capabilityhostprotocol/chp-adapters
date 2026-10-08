@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chp-safety-case"
+version = "0.1.0"
+description = "Portable CHP Safety Case (.chpsafety) bundle format + offline verifier — verify what an AI agent was authorized and able to do, with no network and no trust in the producer."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Project Auxo" }]
+keywords = ["chp", "capability-host-protocol", "ai-safety", "runtime-assurance", "attestation", "safety-case"]
+# The verifier is deliberately minimal: stdlib + cryptography (Ed25519) only. No chp-core, no
+# chp-home — a Safety Case verifies standalone, anywhere.
+dependencies = ["cryptography>=42.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://capabilityhostprotocol.com"
+Issues = "https://github.com/capabilityhostprotocol/chp-core/issues"
+
+[project.scripts]
+chp-safety-case = "chp_safety_case.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["chp_safety_case*"]
